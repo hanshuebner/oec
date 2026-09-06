@@ -3,7 +3,7 @@ import os
 import signal
 import logging
 import time
-from serial import SerialException
+import select
 from coax import open_serial_interface, TerminalType, Feature
 
 from .args import parse_args
@@ -106,38 +106,53 @@ def _create_session(args, device):
 
     raise ValueError('Unsupported emulator')
 
-def _retry_empty_single_reads(serial_port):
-    """Read a single byte again when the port reports data and gives none.
+def _read_through_the_descriptor(serial_port):
+    """Read the port without an empty read costing bytes or ending the run.
 
     A USB serial device ends a transfer that fills its last packet with a zero
-    length one, and the read that follows the port becoming readable returns
-    nothing. pySerial takes that for a disconnected device and raises, which
-    ends the run over an event that means only "no bytes this time".
+    length one, so a port that has just reported data hands over none. pySerial
+    takes that for a disconnected device and raises -- and the bytes it had
+    already gathered for that read go with the exception, so what arrives
+    afterwards is read as the middle of a message.
 
-    Only the single byte read is retried. pySerial gathers what it reads for a
-    larger one in a buffer of its own and drops it when it raises, so a retry
-    there would resume past those bytes and leave the message stream out of
-    step; asked for one byte it has nothing to drop.
+    Reading the port's own descriptor keeps every byte that arrives. Nothing
+    to hand over yet, whether that shows as an empty read or as EAGAIN on the
+    non-blocking descriptor pySerial opens, means only that: the read waits
+    for more until the port's timeout, and a port that stays quiet returns
+    what it has, which the interface library reports as the timeout it is.
     """
-    read = serial_port.read
+    fd = serial_port.fileno()
 
-    def read_retrying_empty(size=1):
-        if size != 1:
-            return read(size)
-
+    def read(size=1):
         deadline = time.monotonic() + (serial_port.timeout or 0)
+        data = bytearray()
 
-        while True:
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            (ready, _, _) = select.select([fd], [], [], remaining)
+
+            if not ready:
+                break
+
             try:
-                return read(1)
-            except SerialException as error:
-                if 'returned no data' not in str(error):
-                    raise
+                chunk = os.read(fd, size - len(data))
+            except (BlockingIOError, InterruptedError):
+                chunk = b''
 
-                if time.monotonic() >= deadline:
-                    return b''
+            if chunk:
+                data.extend(chunk)
+            else:
+                # Readable with nothing behind it: let the port get on with
+                # it rather than asking again as fast as the loop can run.
+                time.sleep(0.001)
 
-    serial_port.read = read_retrying_empty
+        return bytes(data)
+
+    serial_port.read = read
 
 def main():
     args = parse_args(sys.argv[1:], IS_VT100_AVAILABLE)
@@ -159,7 +174,7 @@ def main():
         # interface's own InterfaceTimeout -- which ends the run and lets
         # whatever supervises it start a fresh one -- is never raised.
         interface.serial.timeout = SERIAL_READ_TIMEOUT
-        _retry_empty_single_reads(interface.serial)
+        _read_through_the_descriptor(interface.serial)
 
         controller = Controller(InterfaceWrapper(interface), create_device, create_session)
 
