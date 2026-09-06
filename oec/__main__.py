@@ -2,6 +2,8 @@ import sys
 import os
 import signal
 import logging
+import time
+from serial import SerialException
 from coax import open_serial_interface, TerminalType, Feature
 
 from .args import parse_args
@@ -104,6 +106,39 @@ def _create_session(args, device):
 
     raise ValueError('Unsupported emulator')
 
+def _retry_empty_single_reads(serial_port):
+    """Read a single byte again when the port reports data and gives none.
+
+    A USB serial device ends a transfer that fills its last packet with a zero
+    length one, and the read that follows the port becoming readable returns
+    nothing. pySerial takes that for a disconnected device and raises, which
+    ends the run over an event that means only "no bytes this time".
+
+    Only the single byte read is retried. pySerial gathers what it reads for a
+    larger one in a buffer of its own and drops it when it raises, so a retry
+    there would resume past those bytes and leave the message stream out of
+    step; asked for one byte it has nothing to drop.
+    """
+    read = serial_port.read
+
+    def read_retrying_empty(size=1):
+        if size != 1:
+            return read(size)
+
+        deadline = time.monotonic() + (serial_port.timeout or 0)
+
+        while True:
+            try:
+                return read(1)
+            except SerialException as error:
+                if 'returned no data' not in str(error):
+                    raise
+
+                if time.monotonic() >= deadline:
+                    return b''
+
+    serial_port.read = read_retrying_empty
+
 def main():
     args = parse_args(sys.argv[1:], IS_VT100_AVAILABLE)
 
@@ -124,6 +159,7 @@ def main():
         # interface's own InterfaceTimeout -- which ends the run and lets
         # whatever supervises it start a fresh one -- is never raised.
         interface.serial.timeout = SERIAL_READ_TIMEOUT
+        _retry_empty_single_reads(interface.serial)
 
         controller = Controller(InterfaceWrapper(interface), create_device, create_session)
 
