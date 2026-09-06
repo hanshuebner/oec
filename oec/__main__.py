@@ -2,6 +2,8 @@ import sys
 import os
 import signal
 import logging
+import time
+from serial import SerialException
 from coax import open_serial_interface, TerminalType, Feature
 
 from .args import parse_args
@@ -104,6 +106,34 @@ def _create_session(args, device):
 
     raise ValueError('Unsupported emulator')
 
+def _tolerate_empty_reads(serial_port):
+    """Read again when the port reports data and then hands over none.
+
+    A USB serial device ends a transfer that fills its last packet with a
+    zero length one, and the read that follows the port becoming readable
+    returns nothing. pySerial takes that for a disconnected device and raises,
+    which ends the run over an event that means only "no bytes this time".
+    Reading again is what the caller wants: a port that really has gone quiet
+    hands over nothing until the timeout, which the interface library turns
+    into the timeout it knows how to report.
+    """
+    read = serial_port.read
+
+    def read_tolerating_empty(size=1):
+        deadline = time.monotonic() + (serial_port.timeout or 0)
+
+        while True:
+            try:
+                return read(size)
+            except SerialException as error:
+                if 'returned no data' not in str(error):
+                    raise
+
+                if time.monotonic() >= deadline:
+                    return b''
+
+    serial_port.read = read_tolerating_empty
+
 def main():
     args = parse_args(sys.argv[1:], IS_VT100_AVAILABLE)
 
@@ -124,6 +154,7 @@ def main():
         # interface's own InterfaceTimeout -- which ends the run and lets
         # whatever supervises it start a fresh one -- is never raised.
         interface.serial.timeout = SERIAL_READ_TIMEOUT
+        _tolerate_empty_reads(interface.serial)
 
         controller = Controller(InterfaceWrapper(interface), create_device, create_session)
 
