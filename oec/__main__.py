@@ -33,6 +33,11 @@ _LOG_LEVELS = {
 
 logger = logging.getLogger('oec.main')
 
+# How long to wait for an answer from the interface. A transaction carries its
+# own timeout and the interface answers it either way, so a read that takes
+# longer than this is the interface having stopped talking altogether.
+SERIAL_READ_TIMEOUT = 5
+
 KEYMAP_3278_LANGUAGE = {
     'us': KEYMAP_3278_TYPEWRITER,
     'de': KEYMAP_3278_TYPEWRITER_DE
@@ -113,6 +118,13 @@ def main():
     logger.info('Starting controller...')
 
     with open_serial_interface(args.serial_port) as interface:
+        # An interface that stops answering must not take the controller with
+        # it. pySerial waits for ever on a port opened without a timeout, so
+        # the read of a response that never comes never returns, and the
+        # interface's own InterfaceTimeout -- which ends the run and lets
+        # whatever supervises it start a fresh one -- is never raised.
+        interface.serial.timeout = SERIAL_READ_TIMEOUT
+
         controller = Controller(InterfaceWrapper(interface), create_device, create_session)
 
         def signal_handler(_number, _frame):
