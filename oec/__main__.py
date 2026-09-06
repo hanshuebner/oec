@@ -3,7 +3,7 @@ import os
 import signal
 import logging
 import time
-from serial import SerialException
+import select
 from coax import open_serial_interface, TerminalType, Feature
 
 from .args import parse_args
@@ -107,32 +107,41 @@ def _create_session(args, device):
     raise ValueError('Unsupported emulator')
 
 def _tolerate_empty_reads(serial_port):
-    """Read again when the port reports data and then hands over none.
+    """Read from the port without an empty read costing what was already read.
 
-    A USB serial device ends a transfer that fills its last packet with a
-    zero length one, and the read that follows the port becoming readable
-    returns nothing. pySerial takes that for a disconnected device and raises,
-    which ends the run over an event that means only "no bytes this time".
-    Reading again is what the caller wants: a port that really has gone quiet
-    hands over nothing until the timeout, which the interface library turns
-    into the timeout it knows how to report.
+    A USB serial device ends a transfer that fills its last packet with a zero
+    length one, and the read that follows the port becoming readable returns
+    nothing. pySerial takes that for a disconnected device and raises -- and
+    the bytes it had gathered for that call go with the exception, so what
+    arrives afterwards is read as the middle of a message.
+
+    Reading through the port's own descriptor keeps them: nothing is thrown
+    away, an empty read means "no bytes this time", and a port that stays
+    quiet ends the read at the timeout, which the interface library reports as
+    the timeout it is.
     """
-    read = serial_port.read
+    fd = serial_port.fileno()
 
-    def read_tolerating_empty(size=1):
+    def read(size=1):
         deadline = time.monotonic() + (serial_port.timeout or 0)
+        data = bytearray()
 
-        while True:
-            try:
-                return read(size)
-            except SerialException as error:
-                if 'returned no data' not in str(error):
-                    raise
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
 
-                if time.monotonic() >= deadline:
-                    return b''
+            if remaining <= 0:
+                break
 
-    serial_port.read = read_tolerating_empty
+            (ready, _, _) = select.select([fd], [], [], remaining)
+
+            if not ready:
+                break
+
+            data.extend(os.read(fd, size - len(data)))
+
+        return bytes(data)
+
+    serial_port.read = read
 
 def main():
     args = parse_args(sys.argv[1:], IS_VT100_AVAILABLE)
