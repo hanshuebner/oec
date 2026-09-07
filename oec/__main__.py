@@ -5,6 +5,7 @@ import logging
 import time
 import select
 from coax import open_serial_interface, TerminalType, Feature
+from coax.exceptions import InterfaceTimeout
 
 from .args import parse_args
 from .interface import InterfaceWrapper
@@ -149,6 +150,14 @@ def _read_through_the_descriptor(serial_port):
                 # Readable with nothing behind it: let the port get on with
                 # it rather than asking again as fast as the loop can run.
                 time.sleep(0.001)
+
+        if not data:
+            # Handing back nothing is read as the end of the stream: the SLIP
+            # decoder flushes what it holds and gives it up as a message, so
+            # an answer still arriving comes out truncated and one that has
+            # not started comes out empty. A port with nothing to give has
+            # timed out, which is what the caller is told.
+            raise InterfaceTimeout()
 
         return bytes(data)
 
